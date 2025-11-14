@@ -1,0 +1,1004 @@
+# ==========================================
+# AutorizaMulti_GUI.py — v11.0 Multi-Ativo (Vertical Azul + Painel PREMIUM)
+# ==========================================
+# • Fundo azul-escuro estilo fintech
+# • Multi-Ativos (WIN, WDO, PETR4, VALE3, BTC)
+# • Cada ativo tem:
+#     - Energia própria
+#     - Consistência direcional própria
+#     - Histórico (sparkline) próprio
+#     - Regime próprio (2 símbolos: principal + hedge)
+#     - Arquivo de saída próprio: mercado_<ATIVO>.txt
+# • Medidores verticais 0–100%:
+#     - Energia
+#     - Humor do mercado
+#     - Consistência
+#     - Segmentos coloridos:
+#         0–20%   RED
+#         20–40%  ORANGE
+#         40–60%  YELLOW
+#         60–80%  LIGHT GREEN
+#         80–100% GREEN
+# • Semáforo vertical
+# • Sparkline ampliado
+# • Painel de Timeframes (Curto/Médio/Longo) por ativo
+# • Painel Lateral PREMIUM com scroll (relatório automático)
+# • Botão “Resumo / Previsão do dia” reaproveita o texto do painel
+# • Terminal verde-neon
+# • Salva C:\Analise\mercado_<ATIVO>.txt
+# ==========================================
+
+import os, re, time, datetime, threading, requests, webbrowser
+from collections import deque
+from bs4 import BeautifulSoup
+import tkinter as tk
+from tkinter import ttk
+
+# =========================
+# PARÂMETROS
+# =========================
+PASTA_ANALISE   = r"C:\Analise"
+ARQUIVO_LOG     = os.path.join(PASTA_ANALISE, "log_investing.txt")
+
+CICLO_SEGUNDOS      = 30
+MM_TAMANHO          = 5
+HIST_MAX            = 120
+CONSIST_MIN_OK      = 4
+PERSIST_REGIME_MIN  = 4
+
+LIM_MAIN_TENDENCIA  = 0.30   # equivalente ao antigo LIM_WIN_TENDENCIA
+LIM_HEDGE_TENDENCIA = 0.20   # equivalente ao antigo LIM_DOL_TENDENCIA
+ENERGIA_ON          = 60
+
+# Mapa de ativos (principal + hedge)
+ASSETS = {
+    "WIN": {
+        "descricao": "Mini Índice",
+        "main_symbol": "%5EBVSP",   # Ibovespa
+        "hedge_symbol": "USDBRL=X"  # Dólar
+    },
+    "WDO": {
+        "descricao": "Mini Dólar",
+        "main_symbol": "USDBRL=X",
+        "hedge_symbol": "%5EBVSP"
+    },
+    "PETR4": {
+        "descricao": "PETROBRAS PN",
+        "main_symbol": "PETR4.SA",
+        "hedge_symbol": "%5EBVSP"
+    },
+    "VALE3": {
+        "descricao": "VALE ON",
+        "main_symbol": "VALE3.SA",
+        "hedge_symbol": "%5EBVSP"
+    },
+    "BTC": {
+        "descricao": "Bitcoin",
+        "main_symbol": "BTC-USD",
+        "hedge_symbol": "USDBRL=X"
+    },
+}
+
+# =========================
+# AUXILIARES
+# =========================
+def log(msg: str):
+    try:
+        os.makedirs(PASTA_ANALISE, exist_ok=True)
+        with open(ARQUIVO_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except:
+        pass
+
+def media_movel(vals, n):
+    if not vals:
+        return 0.0
+    n = min(n, len(vals))
+    return round(sum(list(vals)[-n:]) / max(1, n), 4)
+
+def slope(vals, lookback=5):
+    if len(vals) <= lookback:
+        return 0.0
+    return round(vals[-1] - vals[-1 - lookback], 4)
+
+def obter_variacao_yahoo_api(symbol: str):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        data = r.json()
+        meta = data["chart"]["result"][0]["meta"]
+        px  = meta.get("regularMarketPrice", 0)
+        prev = meta.get("chartPreviousClose", 0)
+        if prev == 0:
+            return 0.0
+        return round(((px - prev) / prev) * 100.0, 3)
+    except Exception as e:
+        log(f"YahooAPI {symbol}: {e}")
+        return 0.0
+
+def obter_variacao_investing(url: str):
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        html = r.text
+        s = BeautifulSoup(html, "html.parser")
+        v = s.find("span", {"data-test": "instrument-price-change-percent"})
+        if not v:
+            m = re.search(r"[\(\+\-]?\d+[\,\.]?\d*\s?%", html)
+            if not m:
+                return None
+            texto = m.group(0)
+        else:
+            texto = v.get_text(strip=True)
+
+        texto = (
+            texto.replace("%", "")
+                 .replace("+", "")
+                 .replace("(", "")
+                 .replace(")", "")
+                 .replace(",", ".")
+                 .strip()
+        )
+        return float(texto)
+    except Exception as e:
+        log(f"Investing: {e}")
+        return None
+
+def obter_vix():
+    v = obter_variacao_investing("https://br.investing.com/indices/volatility-s-p-500")
+    if v is None:
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            px   = meta.get("regularMarketPrice", 0)
+            prev = meta.get("chartPreviousClose", 0)
+            v = (px - prev) / prev * 100.0 if prev else 0.0
+        except Exception as e:
+            log(f"YahooAPI ^VIX: {e}")
+            v = 0.0
+    return round(v, 3)
+
+def coletar_manchetes():
+    try:
+        fontes = [
+            "https://www.infomoney.com.br/ultimas-noticias/",
+            "https://valor.globo.com/",
+            "https://economia.estadao.com.br/",
+        ]
+        textos = ""
+        for url in fontes:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            s = BeautifulSoup(r.text, "html.parser")
+            textos += " ".join([t.get_text().lower() for t in s.find_all("h2")])
+        pos = len(re.findall(r"alta|otim|sub|ganh|positiv", textos))
+        neg = len(re.findall(r"queda|negativ|volátil|espera|lateral", textos))
+        return round((pos - neg) / max(1, (pos + neg)), 3)
+    except Exception as e:
+        log(f"Manchetes: {e}")
+        return 0.0
+
+# =========================
+# LÓGICAS
+# =========================
+def regime(main_mm, hedge_mm):
+    if main_mm >= LIM_MAIN_TENDENCIA and hedge_mm <= -LIM_HEDGE_TENDENCIA:
+        return "ALTA"
+    if main_mm <= -LIM_MAIN_TENDENCIA and hedge_mm >= LIM_HEDGE_TENDENCIA:
+        return "BAIXA"
+    return "LATERAL"
+
+def energia_direcional(main_mm, hedge_mm, vix_mm, vix_slope_val, sentimento):
+    """
+    Energia COMPRA x VENDA por ativo.
+    """
+    base = 20 + (10 * max(0, sentimento))
+    buy, sell = base, base
+
+    # padrão "clássico": ativo sobe x hedge cai → compra; inverso → venda
+    if main_mm > 0 and hedge_mm < 0:
+        buy += 30
+    if main_mm < 0 and hedge_mm > 0:
+        sell += 30
+
+    # VIX mais "acordado"
+    if abs(vix_mm) > 1:
+        if vix_slope_val < -0.5:
+            buy += 4
+        if vix_slope_val > 0.5:
+            sell += 4
+
+    return round(min(100, buy), 1), round(min(100, sell), 1)
+
+def consistencia_ok(energias, lados, min_ok=CONSIST_MIN_OK):
+    if len(energias) < 5:
+        return False, "NEUTRO"
+    e5 = list(energias)[-5:]
+    l5 = list(lados)[-5:]
+    on = sum(1 for e in e5 if e >= ENERGIA_ON)
+    lado_pred = max(set(l5), key=l5.count)
+    lado_ok = sum(1 for l in l5 if l == lado_pred)
+    return (on >= min_ok and lado_ok >= min_ok), lado_pred
+
+def regime_persistente(regs, min_ciclos=PERSIST_REGIME_MIN):
+    if len(regs) < min_ciclos:
+        return False
+    ult = list(regs)[-min_ciclos:]
+    return len(set(ult)) == 1 and ult[-1] in ("ALTA", "BAIXA")
+
+def salvar_resultado(ativo, status, lado, energia, reg, vix_mm, sentimento):
+    os.makedirs(PASTA_ANALISE, exist_ok=True)
+    caminho = os.path.join(PASTA_ANALISE, f"mercado_{ativo}.txt")
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(f"ATIVO={ativo}\n")
+        f.write(f"MERCADO={status}\n")
+        f.write(f"LADO={lado}\n")
+        f.write(f"ENERGIA={energia}\n")
+        f.write(f"REGIME={reg}\n")
+        f.write(f"VIX={vix_mm}\n")
+        f.write(f"SENTIMENTO={sentimento}\n")
+
+# =========================
+# GUI
+# =========================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Autoriza • Painel de Mercado Multi-Ativo (Leigos)")
+        self.geometry("1200x800")
+        self.configure(bg="#06111f")  # azul bem escuro
+
+        # ESTADO POR ATIVO
+        self.asset_data = {}
+        for atv in ASSETS.keys():
+            self.asset_data[atv] = {
+                "main_hist":   deque(maxlen=HIST_MAX),
+                "hedge_hist":  deque(maxlen=HIST_MAX),
+                "vix_hist":    deque(maxlen=HIST_MAX),
+                "energia_hist":deque(maxlen=60),
+                "lado_hist":   deque(maxlen=60),
+                "regime_hist": deque(maxlen=60),
+                "status":      "INATIVO",
+                "lado":        "NEUTRO",
+                # métricas mais recentes (para painel / popup)
+                "last_energia":    0.0,
+                "last_reg":        "LATERAL",
+                "last_vix_mm":     0.0,
+                "last_sent":       0.0,
+                "last_consistente":False,
+            }
+
+        self.active_asset = tk.StringVar(value=list(ASSETS.keys())[0])
+
+        # ===== BOTÕES DE LINKS (YouTube / WhatsApp) =====
+        self.build_top_links()
+
+        # ===== BARRA DE ATIVOS + BOTÃO RESUMO =====
+        self.build_asset_bar()
+
+        # ===== LINHA: LEDs + Semáforo + Gauges + Painel PREMIUM =====
+        self.build_row_gauges_and_report()
+
+        # ===== SPARKLINE =====
+        self.build_sparkline()
+
+        # ===== TIMEFRAMES =====
+        self.build_timeframes()
+
+        # ===== TERMINAL =====
+        self.build_terminal()
+
+        # ===== STATUS BAR =====
+        self.status_var = tk.StringVar(value="Inicializando…")
+        tk.Label(
+            self, textvariable=self.status_var, anchor="w",
+            bg="#06111f", fg="#d0d7ff", font=("Consolas", 10)
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        # Controle
+        self.stop_event = threading.Event()
+        self.current_status = "INATIVO"
+        self.current_lado   = "NEUTRO"
+
+        # buffer com texto usado também no popup
+        self.last_report_text = "Aguardando dados do mercado…"
+
+        # LOOP DE MONITORAMENTO
+        threading.Thread(target=self.monitorar, daemon=True).start()
+        self.after(400, self.refresh_leds)
+        self.after(1000, self.update_sparkline)
+        self.after(1200, self.update_timeframes)
+
+    # ---------- Construção UI ----------
+    def build_top_links(self):
+        top_buttons = tk.Frame(self, bg="#06111f")
+        top_buttons.pack(fill="x", padx=12, pady=(10, 4))
+
+        def abrir_youtube():
+            webbrowser.open("https://www.youtube.com/@meubottrader")
+
+        def abrir_whatsapp():
+            webbrowser.open("http://wa.me/+5554981125628")
+
+        def estilo_botao(botao, cor_base, cor_hover):
+            def on_enter(e): botao.config(bg=cor_hover)
+            def on_leave(e): botao.config(bg=cor_base)
+            botao.bind("<Enter>", on_enter)
+            botao.bind("<Leave>", on_leave)
+
+        btn1 = tk.Button(
+            top_buttons,
+            text="📺  VISITE NOSSO CANAL",
+            command=abrir_youtube,
+            font=("Consolas", 11, "bold"),
+            fg="#ffffff",
+            bg="#e63946",
+            activeforeground="#ffffff",
+            activebackground="#ff4d6d",
+            relief="flat",
+            cursor="hand2",
+            width=28,
+            height=2
+        )
+        btn1.pack(side="left", padx=(0, 12), pady=4)
+        estilo_botao(btn1, "#e63946", "#ff4d6d")
+
+        btn2 = tk.Button(
+            top_buttons,
+            text="🤖  SOLICITE NOSSA AUTOMAÇÃO (5 DIAS)",
+            command=abrir_whatsapp,
+            font=("Consolas", 11, "bold"),
+            fg="#ffffff",
+            bg="#1db954",
+            activeforeground="#ffffff",
+            activebackground="#39ff14",
+            relief="flat",
+            cursor="hand2",
+            width=35,
+            height=2
+        )
+        btn2.pack(side="left", padx=(0, 12), pady=4)
+        estilo_botao(btn2, "#1db954", "#39ff14")
+
+    def build_asset_bar(self):
+        bar = tk.Frame(self, bg="#06111f")
+        bar.pack(fill="x", padx=12, pady=(2, 4))
+
+        tk.Label(
+            bar, text="Ativo:",
+            bg="#06111f", fg="#8fa5ff",
+            font=("Consolas", 10, "bold")
+        ).pack(side="left", padx=(0, 6))
+
+        for atv, cfg in ASSETS.items():
+            b = tk.Button(
+                bar, text=f"{atv} ({cfg['descricao']})",
+                command=lambda a=atv: self.set_active_asset(a),
+                font=("Consolas", 9),
+                fg="#d0d7ff",
+                bg="#0b1a2e",
+                activeforeground="#ffffff",
+                activebackground="#1c2c45",
+                relief="flat",
+                cursor="hand2",
+                padx=8, pady=2
+            )
+            b.pack(side="left", padx=3)
+
+        tk.Button(
+            bar, text="📊 RESUMO / PREVISÃO DO DIA",
+            command=self.abrir_resumo_dia,
+            font=("Consolas", 9, "bold"),
+            fg="#06111f",
+            bg="#ffd60a",
+            activeforeground="#06111f",
+            activebackground="#ffe66a",
+            relief="flat",
+            cursor="hand2",
+            padx=10, pady=3
+        ).pack(side="right")
+
+    def build_row_gauges_and_report(self):
+        row2 = tk.Frame(self, bg="#06111f")
+        row2.pack(fill="x", padx=12, pady=(4, 4))
+
+        # Coluna esquerda: LEDs + Semáforo
+        left_col = tk.Frame(row2, bg="#06111f")
+        left_col.pack(side="left", padx=(0, 12))
+
+        self.leds_canvas = tk.Canvas(left_col, width=120, height=40,
+                                     bg="#06111f", highlightthickness=0)
+        self.leds_canvas.pack(pady=(4, 6))
+        self.leds = [
+            self.leds_canvas.create_oval(
+                x, 10, x+22, 32,
+                fill="#444b63", outline="#222733"
+            )
+            for x in (10, 42, 74)
+        ]
+
+        self.semaforo = tk.Canvas(left_col, width=80, height=180,
+                                  bg="#06111f", highlightthickness=0)
+        self.semaforo.pack()
+        self.sem_bar_bg = self.semaforo.create_rectangle(
+            30, 10, 50, 170, fill="#05101d", outline="#1b2735"
+        )
+        self.sem_segments = []
+        colors_off = ["#3a1010", "#3a2a10", "#383810", "#103a10"]
+        y0 = 20
+        for c in colors_off:
+            seg = self.semaforo.create_rectangle(
+                32, y0, 48, y0+30,
+                fill=c, outline="#020509"
+            )
+            self.sem_segments.append(seg)
+            y0 += 35
+
+        self.semaforo_lbl = tk.Label(
+            left_col, text="Condição: —",
+            bg="#06111f", fg="#d0d7ff",
+            font=("Consolas", 10)
+        )
+        self.semaforo_lbl.pack(pady=(4, 0))
+
+        # Coluna central: 3 gauges verticais
+        gauges_col = tk.Frame(row2, bg="#06111f")
+        gauges_col.pack(side="left", expand=True, fill="x")
+
+        def criar_gauge(parent, titulo):
+            frame = tk.Frame(parent, bg="#06111f")
+            canvas = tk.Canvas(frame, width=150, height=260,
+                               bg="#06111f", highlightthickness=0)
+            canvas.pack(pady=(4, 0))
+            tk.Label(
+                frame, text=titulo,
+                bg="#06111f", fg="#d0d7ff",
+                font=("Consolas", 11)
+            ).pack(pady=(0, 2))
+            return frame, canvas
+
+        self.gauge_frame_energy, self.gauge_energy  = criar_gauge(gauges_col, "Energia")
+        self.gauge_frame_humor,  self.gauge_humor   = criar_gauge(gauges_col, "Humor")
+        self.gauge_frame_consist,self.gauge_consist = criar_gauge(gauges_col, "Consistência")
+
+        self.gauge_frame_energy.pack(side="left", expand=True)
+        self.gauge_frame_humor.pack(side="left", expand=True)
+        self.gauge_frame_consist.pack(side="left", expand=True)
+
+        # Coluna direita: Painel PREMIUM com scroll
+        right_col = tk.Frame(row2, bg="#06111f", width=320)
+        right_col.pack(side="left", fill="y", padx=(12, 0))
+
+        tk.Label(
+            right_col, text="Relatório automático (ativo atual)",
+            bg="#06111f", fg="#8fa5ff",
+            font=("Consolas", 10, "bold")
+        ).pack(anchor="w", pady=(0, 2))
+
+        container = tk.Frame(right_col, bg="#020812")
+        container.pack(fill="both", expand=True)
+
+        scroll = tk.Scrollbar(container, orient="vertical")
+        scroll.pack(side="right", fill="y")
+
+        self.report_text = tk.Text(
+            container,
+            bg="#020812", fg="#ffffff",
+            insertbackground="#ffffff",
+            relief="flat",
+            font=("Consolas", 9),
+            wrap="word",
+            yscrollcommand=scroll.set,
+            height=16
+        )
+        self.report_text.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        scroll.config(command=self.report_text.yview)
+
+        self.report_text.insert("end", "Aguardando dados do mercado…")
+        self.report_text.configure(state="disabled")
+
+    def build_sparkline(self):
+        spark_frame = tk.Frame(self, bg="#06111f")
+        spark_frame.pack(fill="x", padx=12, pady=(4, 4))
+
+        tk.Label(
+            spark_frame, text="Histórico recente de Energia (por ativo)",
+            bg="#06111f", fg="#8fa5ff",
+            font=("Consolas", 10)
+        ).pack(anchor="w")
+
+        self.spark = tk.Canvas(
+            spark_frame, height=100,
+            bg="#020812", highlightthickness=0
+        )
+        self.spark.pack(fill="x", pady=(2, 0))
+
+    def build_timeframes(self):
+        tf = tk.Frame(self, bg="#06111f")
+        tf.pack(fill="x", padx=12, pady=(4, 4))
+        tk.Label(
+            tf, text="Timeframes mais favoráveis (estimativa por ativo)",
+            bg="#06111f", fg="#8fa5ff",
+            font=("Consolas", 10)
+        ).pack(anchor="w")
+
+        self.tf_canvas = tk.Canvas(
+            tf, height=110,
+            bg="#020812", highlightthickness=0
+        )
+        self.tf_canvas.pack(fill="x", pady=(2, 0))
+
+    def build_terminal(self):
+        self.text = tk.Text(
+            self, bg="#050505", fg="#39ff14",
+            insertbackground="#39ff14",
+            relief="flat", font=("Consolas", 11),
+            wrap="word"
+        )
+        self.text.pack(fill="both", expand=True, padx=12, pady=6)
+        self.text.configure(state="disabled")
+
+    # ---------- Helpers ----------
+    def set_active_asset(self, ativo):
+        self.active_asset.set(ativo)
+        self.log_gui(f"[INFO] Ativo selecionado: {ativo} ({ASSETS[ativo]['descricao']})")
+        self.update_sparkline()
+        self.update_timeframes()
+        # ao trocar de ativo, atualiza também painel premium com o que já tiver
+        texto = self.montar_relatorio_premium(ativo, self.asset_data[ativo])
+        self.atualizar_painel_relatorio(texto)
+
+    def set_leds(self, color):
+        for led in self.leds:
+            self.leds_canvas.itemconfig(led, fill=color)
+
+    def refresh_leds(self):
+        self.set_leds("#14ff72" if self.current_status == "ATIVO" else "#ff3b30")
+        self.after(500, self.refresh_leds)
+
+    def log_gui(self, text):
+        self.text.configure(state="normal")
+        self.text.insert("end", text + "\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+    # ---------- Gauges Verticais ----------
+    def draw_vertical_gauge(self, canvas, valor):
+        canvas.delete("all")
+        valor = max(0.0, min(100.0, float(valor)))
+
+        width  = 60
+        height = 200
+        x0 = 30
+        y0 = 20
+        x1 = x0 + width
+        y1 = y0 + height
+
+        canvas.create_rectangle(
+            x0, y0, x1, y1,
+            fill="#0b1a2e", outline="#152949"
+        )
+
+        cores   = ["#ff3b30", "#ff8c00", "#ffd60a", "#6aff70", "#00c853"]
+        limites = [20, 40, 60, 80, 100]
+        seg_alt = height // 5
+
+        for i, (cor, lim) in enumerate(zip(cores, limites)):
+            sy1 = y1 - seg_alt * (i + 1)
+            sy0 = sy1 + seg_alt
+            ativo = valor >= lim
+            fill = cor if ativo else "#37455c"
+            canvas.create_rectangle(
+                x0+10, sy1+4, x1-10, sy0-4,
+                fill=fill, outline="#0b1a2e"
+            )
+
+        canvas.create_text(
+            x1 + 25, (y0 + y1)//2,
+            text=f"{int(valor)}%",
+            fill="#d0d7ff",
+            font=("Consolas", 12, "bold")
+        )
+
+    def set_semaforo(self, condition_text):
+        cores_off = ["#3a1010", "#3a2a10", "#383810", "#103a10"]
+        for seg, c in zip(self.sem_segments, cores_off):
+            self.semaforo.itemconfig(seg, fill=c)
+
+        if condition_text == "TENDÊNCIA FORTE":
+            self.semaforo.itemconfig(self.sem_segments[3], fill="#00c853")
+        elif condition_text == "OBSERVAÇÃO":
+            self.semaforo.itemconfig(self.sem_segments[2], fill="#ffd60a")
+        else:
+            self.semaforo.itemconfig(self.sem_segments[0], fill="#ff3b30")
+
+        self.semaforo_lbl.config(text=f"Condição: {condition_text}")
+
+    # ---------- Sparkline & Timeframes ----------
+    def get_current_asset_data(self):
+        return self.asset_data[self.active_asset.get()]
+
+    def update_sparkline(self):
+        self.spark.delete("all")
+        data = self.get_current_asset_data()
+        pts  = list(data["energia_hist"])
+        if len(pts) < 2:
+            self.after(1000, self.update_sparkline)
+            return
+
+        w = self.spark.winfo_width() or 900
+        h = 100
+        escala = (h - 20) / max(100, max(pts))
+        prev_x, prev_y = 10, h - pts[0] * escala - 10
+        passo = (w - 20) / max(10, len(pts))
+
+        for i, val in enumerate(pts[1:], 1):
+            x = 10 + i * passo
+            y = h - val * escala - 10
+            cor = "#39ff14" if val >= pts[i-1] else "#ff3b30"
+            self.spark.create_line(prev_x, prev_y, x, y, fill=cor, width=2)
+            prev_x, prev_y = x, y
+
+        self.after(1000, self.update_sparkline)
+
+    def update_timeframes(self):
+        self.tf_canvas.delete("all")
+        w = self.tf_canvas.winfo_width() or 900
+        x, y = 16, 18
+
+        data = self.get_current_asset_data()
+        energia_hist = data["energia_hist"]
+        lado_hist    = data["lado_hist"]
+
+        names = [
+            ("Curto (~1–3m)", 5),
+            ("Médio (~5–10m)", 15),
+            ("Longo (~10–20m)", 30)
+        ]
+
+        for label, win in names:
+            if len(energia_hist) >= 2:
+                e_vals = list(energia_hist)[-win:] if len(energia_hist) >= win else list(energia_hist)
+                l_vals = list(lado_hist)[-win:]     if len(lado_hist)    >= win else list(lado_hist)
+                media_e = sum(e_vals) / max(1, len(e_vals))
+                consist = 0
+                if len(l_vals) > 1:
+                    lado_pred = max(set(l_vals), key=l_vals.count)
+                    consist = sum(1 for l in l_vals if l == lado_pred) / len(l_vals)
+                score = int(min(100, 0.7 * media_e + 30 * consist))
+            else:
+                score = 0
+
+            self.tf_canvas.create_text(
+                x, y, text=label,
+                fill="#d0d7ff", font=("Consolas", 10), anchor="w"
+            )
+            bar_x  = 220
+            full_w = w - 260
+            bar_w  = int(full_w * (score / 100))
+            color  = "#ff3b30" if score < 50 else ("#ffd60a" if score < 70 else "#39ff14")
+
+            self.tf_canvas.create_rectangle(
+                bar_x, y-8, bar_x + full_w, y+8,
+                fill="#071529", outline="#18263b"
+            )
+            self.tf_canvas.create_rectangle(
+                bar_x, y-8, bar_x + bar_w, y+8,
+                fill=color, outline=""
+            )
+            self.tf_canvas.create_text(
+                bar_x + full_w - 4, y,
+                text=f"{score}%",
+                fill="#d0d7ff",
+                font=("Consolas", 10),
+                anchor="e"
+            )
+            y += 28
+
+        self.after(3000, self.update_timeframes)
+
+    # ---------- Painel PREMIUM ----------
+    def montar_relatorio_premium(self, atv, data):
+        desc = ASSETS[atv]["descricao"]
+
+        energia_vals = list(data["energia_hist"])
+        if energia_vals:
+            recortes = energia_vals[-30:] if len(energia_vals) > 30 else energia_vals
+            energia_media = sum(recortes) / len(recortes)
+            energia_atual = energia_vals[-1]
+        else:
+            energia_media = 0.0
+            energia_atual = 0.0
+
+        vix_vals = list(data["vix_hist"])
+        if vix_vals:
+            vix_rec = vix_vals[-30:] if len(vix_vals) > 30 else vix_vals
+            vix_med = sum(vix_rec) / len(vix_rec)
+        else:
+            vix_med = 0.0
+
+        reg_atual = data["regime_hist"][-1] if data["regime_hist"] else "LATERAL"
+        sentimento = data.get("last_sent", 0.0)
+
+        # consistência direcional em % (últimos 20 ciclos)
+        lados = list(data["lado_hist"])
+        if len(lados) >= 5:
+            ult = lados[-20:]
+            lado_pred = max(set(ult), key=ult.count)
+            cons = sum(1 for l in ult if l == lado_pred) / len(ult)
+            consist_pct = int(cons * 100)
+        else:
+            consist_pct = 0
+
+        # Probabilidades de ALTA, BAIXA, LATERAL (modelo simples, mas coerente)
+        em = max(0.0, min(100.0, energia_media))
+        t_alta  = max(0.0, em * (1.2 if reg_atual == "ALTA"  else 0.6))
+        t_baixa = max(0.0, em * (1.2 if reg_atual == "BAIXA" else 0.6))
+        t_lat   = max(5.0, 120.0 - em * 1.2)
+        total   = t_alta + t_baixa + t_lat
+        if total <= 0:
+            alta_prob = baixa_prob = 0
+            lateral_prob = 100
+        else:
+            alta_prob    = int(round(100 * t_alta / total))
+            baixa_prob   = int(round(100 * t_baixa / total))
+            lateral_prob = max(0, 100 - alta_prob - baixa_prob)
+
+        if alta_prob >= baixa_prob and alta_prob >= lateral_prob:
+            tend_dominante = "ALTA"
+        elif baixa_prob >= alta_prob and baixa_prob >= lateral_prob:
+            tend_dominante = "BAIXA"
+        else:
+            tend_dominante = "LATERAL"
+
+        # Score "institucional" 0–100
+        dir_prob = max(alta_prob, baixa_prob)
+        score_inst = int(max(0, min(100,
+            0.40 * energia_atual +
+            0.25 * consist_pct +
+            0.15 * dir_prob +
+            0.10 * max(0, 50 - abs(vix_med)) +
+            0.10 * (50 + sentimento * 50)
+        )))
+        qualidade_dia = int((score_inst + energia_media) / 2)
+
+        # sentimento textual
+        if sentimento > 0.15:
+            sent_txt = "positivo"
+        elif sentimento < -0.15:
+            sent_txt = "negativo"
+        else:
+            sent_txt = "neutro"
+
+        # leitura por timeframes (bem resumida)
+        tf_bloco = []
+        for nome, win in [("Curto", 5), ("Médio", 15), ("Longo", 30)]:
+            if len(energia_vals) >= 2:
+                e_vals = energia_vals[-win:] if len(energia_vals) >= win else energia_vals
+                l_vals = lados[-win:]        if len(lados)        >= win else lados
+                med_e  = sum(e_vals) / len(e_vals)
+                if len(l_vals) > 0:
+                    lado_pred = max(set(l_vals), key=l_vals.count)
+                else:
+                    lado_pred = "COMPRA"
+                if med_e < 40:
+                    situ = "fraco / sem direção"
+                elif med_e < 60:
+                    situ = f"operável, foco em {lado_pred.lower()}"
+                else:
+                    situ = f"forte para {lado_pred.lower()}"
+                tf_bloco.append(f"- {nome}: energia ~{med_e:0.1f}% → {situ}")
+            else:
+                tf_bloco.append(f"- {nome}: dados insuficientes ainda.")
+
+        texto = []
+        texto.append(f"ATIVO: {atv} – {desc}")
+        texto.append(f"Regime predominante: {reg_atual}")
+        texto.append(f"Energia atual: {energia_atual:0.1f}%")
+        texto.append(f"Energia média (últimos ciclos): {energia_media:0.1f}%")
+        texto.append(f"Consistência direcional: {consist_pct}%")
+        texto.append(f"VIX médio estimado: {vix_med:0.2f}%")
+        texto.append(f"Sentimento de notícias: {sent_txt}")
+        texto.append("")
+
+        texto.append("Probabilidade de cenário (modelo interno):")
+        texto.append(f"- ALTA      ≈ {alta_prob}%")
+        texto.append(f"- BAIXA     ≈ {baixa_prob}%")
+        texto.append(f"- LATERAL   ≈ {lateral_prob}%")
+        texto.append(f"=> Tendência mais provável: {tend_dominante}")
+        texto.append("")
+
+        texto.append(f"Score institucional (0–100): {score_inst}")
+        texto.append(f"Qualidade média do dia:      {qualidade_dia}")
+        if qualidade_dia >= 75:
+            texto.append("→ Dia com bom potencial direcional. Vale priorizar operações na direção dominante.")
+        elif qualidade_dia >= 50:
+            texto.append("→ Dia intermediário: operável, mas é importante selecionar bem os pontos de entrada.")
+        else:
+            texto.append("→ Dia fraco: ideal reduzir exposição, operar pouco ou apenas observar.")
+        texto.append("")
+
+        texto.append("Leitura por timeframes:")
+        texto.extend(tf_bloco)
+        texto.append("")
+
+        if reg_atual == "ALTA":
+            texto.append("Comentário de viés:")
+            texto.append("- Mercado com viés de ALTA. Cuide para não entrar atrasado em rompimentos.")
+            texto.append("- Pullbacks até regiões de suporte tendem a ser melhores oportunidades.")
+        elif reg_atual == "BAIXA":
+            texto.append("Comentário de viés:")
+            texto.append("- Mercado com viés de BAIXA. Rompimentos de fundos costumam ter continuidade.")
+            texto.append("- Operar contra a tendência aumenta muito o risco de stop rápido.")
+        else:
+            texto.append("Comentário de viés:")
+            texto.append("- Mercado predominantemente LATERAL.")
+            texto.append("- Maior risco de rompimentos falsos e stop em zonas de consolidação.")
+        texto.append("")
+
+        texto.append("Resumo rápido:")
+        if qualidade_dia >= 70 and tend_dominante != "LATERAL":
+            texto.append("- Cenário favorável para seguir a tendência dominante.")
+            texto.append("- Trabalhe com gestão de risco, mas é um dia que pode ‘andar’ bem.")
+        elif tend_dominante == "LATERAL":
+            texto.append("- Predomínio de lateralização. Evite operar rompimentos sem confirmação forte.")
+        else:
+            texto.append("- Mercado misto. Aguarde alinhamento entre energia, consistência e probabilidade de tendência.")
+
+        return "\n".join(texto)
+
+    def atualizar_painel_relatorio(self, texto):
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", "end")
+        self.report_text.insert("end", texto)
+        self.report_text.configure(state="disabled")
+        self.last_report_text = texto
+
+    # ---------- Resumo / Previsão do Dia (popup reaproveitando texto do painel) ----------
+    def abrir_resumo_dia(self):
+        atv  = self.active_asset.get()
+        data = self.asset_data[atv]
+        texto = self.montar_relatorio_premium(atv, data)
+        self.atualizar_painel_relatorio(texto)
+
+        top = tk.Toplevel(self)
+        top.title(f"Resumo / Previsão do Dia — {atv}")
+        top.configure(bg="#06111f")
+        top.geometry("600x450")
+
+        txt = tk.Text(
+            top, bg="#050505", fg="#d0d7ff",
+            insertbackground="#d0d7ff",
+            relief="flat", font=("Consolas", 10),
+            wrap="word"
+        )
+        txt.pack(fill="both", expand=True, padx=12, pady=12)
+        txt.insert("end", texto)
+        txt.configure(state="disabled")
+
+    # ==========================================
+    # MONITORAMENTO
+    # ==========================================
+    def monitorar(self):
+        self.log_gui("=== MONITORAMENTO — v11.0 Multi-Ativo (Vertical Azul + PREMIUM) ===")
+        status_global = "INATIVO"
+
+        while not self.stop_event.is_set():
+            try:
+                vix  = obter_vix()
+                sent = coletar_manchetes()
+
+                for atv, cfg in ASSETS.items():
+                    data = self.asset_data[atv]
+
+                    main_var  = obter_variacao_yahoo_api(cfg["main_symbol"])
+                    hedge_var = obter_variacao_yahoo_api(cfg["hedge_symbol"])
+
+                    data["main_hist"].append(main_var)
+                    data["hedge_hist"].append(hedge_var)
+                    data["vix_hist"].append(vix)
+
+                    main_mm  = media_movel(data["main_hist"], MM_TAMANHO)
+                    hedge_mm = media_movel(data["hedge_hist"], MM_TAMANHO)
+                    vix_mm   = media_movel(data["vix_hist"], MM_TAMANHO)
+                    vix_slope_val = slope(list(data["vix_hist"]), 5)
+
+                    reg = regime(main_mm, hedge_mm)
+                    data["regime_hist"].append(reg)
+
+                    e_buy, e_sell = energia_direcional(main_mm, hedge_mm, vix_mm, vix_slope_val, sent)
+                    energia, lado = (e_buy, "COMPRA") if e_buy >= e_sell else (e_sell, "VENDA")
+
+                    data["energia_hist"].append(energia)
+                    data["lado_hist"].append(lado)
+
+                    consistente, _ = consistencia_ok(data["energia_hist"], data["lado_hist"])
+                    reg_ok = regime_persistente(data["regime_hist"])
+                    ativo  = (energia >= ENERGIA_ON and consistente and reg_ok)
+                    data["status"] = "ATIVO" if ativo else "INATIVO"
+                    data["lado"]   = lado
+
+                    # guarda últimas métricas para o painel/popup
+                    data["last_energia"]    = energia
+                    data["last_reg"]        = reg
+                    data["last_vix_mm"]     = vix_mm
+                    data["last_sent"]       = sent
+                    data["last_consistente"]= consistente
+
+                    # Se for o ativo selecionado, atualiza a UI
+                    if atv == self.active_asset.get():
+                        self.current_status = data["status"]
+                        self.current_lado   = lado
+
+                        # Gauges
+                        self.draw_vertical_gauge(self.gauge_energy, energia)
+                        humor_val = max(0.0, min(100.0, (sent + 1) * 50))
+                        self.draw_vertical_gauge(self.gauge_humor, humor_val)
+
+                        if len(data["lado_hist"]) >= 5:
+                            ult = list(data["lado_hist"])[-20:]
+                            lado_pred = max(set(ult), key=ult.count)
+                            cons = sum(1 for l in ult if l == lado_pred) / len(ult)
+                            consist_pct = int(cons * 100)
+                        else:
+                            consist_pct = 0
+                        self.draw_vertical_gauge(self.gauge_consist, consist_pct)
+
+                        # Semáforo
+                        if reg == "LATERAL" or energia < 50:
+                            cond = "LATERAL/ARRISCADO"
+                        elif energia >= 75 and consistente and reg_ok:
+                            cond = "TENDÊNCIA FORTE"
+                        else:
+                            cond = "OBSERVAÇÃO"
+                        self.set_semaforo(cond)
+
+                        agora = datetime.datetime.now().strftime("%H:%M:%S")
+                        linha = (f"[{agora}][{atv}] "
+                                 f"{'👉 OPERAR' if data['status']=='ATIVO' else '✋ NÃO OPERAR'} | "
+                                 f"Lado={lado} | Regime={reg} | VIX={vix_mm}% | Energia={energia} | Sent={sent}")
+                        self.log_gui(linha)
+                        self.status_var.set(
+                            f"Ativo: {atv} • Status: {data['status']} • Lado: {lado} • {agora}"
+                        )
+
+                        # Recomendações resumidas no terminal
+                        rec = self.gerar_recomendacao(data['status'], reg, energia, consistente, vix_mm)
+                        self.log_gui(f"→ {rec}")
+
+                        # Atualiza painel lateral PREMIUM
+                        texto = self.montar_relatorio_premium(atv, data)
+                        self.atualizar_painel_relatorio(texto)
+
+                    # Sempre salva arquivo por ativo
+                    salvar_resultado(atv, data["status"], lado, energia, reg, vix_mm, sent)
+
+                status_global = "ATIVO" if any(d["status"] == "ATIVO" for d in self.asset_data.values()) else "INATIVO"
+                self.current_status = status_global
+
+            except Exception as e:
+                self.log_gui(f"[ERRO] {e}")
+
+            time.sleep(CICLO_SEGUNDOS)
+
+    # Recomendações em linguagem simples (terminal)
+    def gerar_recomendacao(self, status, reg, energia, consistente, vix_mm):
+        if status == "ATIVO" and reg != "LATERAL" and consistente and energia >= 75:
+            return "Condições boas: tendência consistente. Priorize entradas na direção (pullbacks curtos)."
+        if reg == "LATERAL":
+            return "Mercado lateral/comprimido. Evite operar; aguarde rompimento ou aumento de energia."
+        if vix_mm > 3:
+            return "Volatilidade elevada. Se operar, use alvos curtos e stops mais largos."
+        if energia < 50:
+            return "Energia fraca. Melhor observar até o mercado ganhar direção."
+        if consistente:
+            return "Direção ganhando consistência; aguarde confirmação para ativar."
+        return "Aguardando sinais mais claros do mercado."
+
+# =========================
+# EXECUÇÃO
+# =========================
+if __name__ == "__main__":
+    os.makedirs(PASTA_ANALISE, exist_ok=True)
+    app = App()
+    app.mainloop()
